@@ -2,10 +2,11 @@ const fs = require('fs');
 const path = require('path');
 const cheerio = require('cheerio');
 
-const USER_AGENT = 'FlyRankInternshipA9/1.0 (+https://github.com/anmolfaraz12/polite-scraper)';
+const USER_AGENT = 'FlyRankInternshipA9/1.0 (+https://github.com/YOUR_USERNAME/YOUR_REPO)';
 const TIMEOUT_MS = 8000;
 const DELAY_MS = 500;
 const CACHE_DIR = path.join(__dirname, '..', 'cache');
+const MAX_CATALOGUE_PAGES = 3; // assignment scope: only the first 3 pages
 
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -17,7 +18,6 @@ function sleep(ms) {
 
 /**
  * Fetches a URL politely, or reads it from cache if already saved.
- * Returns { html, fromCache } so callers know whether a real request happened.
  */
 async function fetchWithCache(url, cacheFileName) {
   const cachePath = path.join(CACHE_DIR, cacheFileName);
@@ -55,13 +55,22 @@ async function fetchWithCache(url, cacheFileName) {
 }
 
 /**
- * Discovers all catalogue pages (following "next" links) and collects
- * every unique, absolute book URL found across them.
+ * Turns a book detail page's URL into a safe cache file name,
+ * e.g. ".../a-light-in-the-attic_1000/index.html" -> "book-a-light-in-the-attic_1000.html"
  */
-const MAX_CATALOGUE_PAGES = 3; // assignment scope: only the first 3 pages
+function cacheNameForBookUrl(bookUrl) {
+  const parts = bookUrl.split('/').filter(Boolean);
+  const slug = parts[parts.length - 2]; // the folder name before index.html
+  return `book-${slug}.html`;
+}
 
+/**
+ * Discovers the first MAX_CATALOGUE_PAGES catalogue pages and collects
+ * every unique, absolute book URL found across them, remembering which
+ * catalogue page each book came from (source_page).
+ */
 async function discoverCataloguePages() {
-  const bookUrls = new Set();
+  const bookEntries = new Map(); // url -> sourcePage
   let pageNumber = 1;
   let pageUrl = 'https://books.toscrape.com/catalogue/page-1.html';
   let pagesVisited = 0;
@@ -71,46 +80,98 @@ async function discoverCataloguePages() {
     const { html, fromCache } = await fetchWithCache(pageUrl, cacheFileName);
     pagesVisited++;
 
-    // Only delay after a REAL request, never after a cache hit
     if (!fromCache) {
       await sleep(DELAY_MS);
     }
 
     const $ = cheerio.load(html);
 
-    // Collect every book link on this page, convert relative -> absolute
     $('h3 a').each((_, el) => {
       const href = $(el).attr('href');
       if (href) {
         const absoluteUrl = new URL(href, pageUrl).toString();
-        bookUrls.add(absoluteUrl);
+        if (!bookEntries.has(absoluteUrl)) {
+          bookEntries.set(absoluteUrl, pageUrl);
+        }
       }
     });
 
-    // Stop once we've reached the page limit — don't even look for "next"
     if (pagesVisited >= MAX_CATALOGUE_PAGES) {
       break;
     }
 
-    // Find the "next" link, if any, and turn it into an absolute URL too
     const nextHref = $('.next a').attr('href');
     if (nextHref) {
       pageUrl = new URL(nextHref, pageUrl).toString();
       pageNumber++;
     } else {
-      pageUrl = null; // no more pages, stop the loop
+      pageUrl = null;
     }
   }
 
-  return { bookUrls: Array.from(bookUrls), pagesVisited };
+  return bookEntries; // Map<bookUrl, sourcePage>
+}
+
+// Maps a star-rating class like "star-rating Three" to the word "Three"
+const RATING_WORDS = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five'];
+
+/**
+ * Fetches one book detail page and extracts the 8 raw fields.
+ */
+async function extractBookRecord(bookUrl, sourcePage) {
+  const cacheFileName = cacheNameForBookUrl(bookUrl);
+  const { html, fromCache } = await fetchWithCache(bookUrl, cacheFileName);
+
+  if (!fromCache) {
+    await sleep(DELAY_MS);
+  }
+
+  const $ = cheerio.load(html);
+  const productArea = $('.product_page'); // scope selectors to the product area
+
+  const title = productArea.find('div.product_main h1').text().trim();
+
+  const priceText = productArea.find('div.product_main p.price_color').text().trim();
+
+  const availabilityText = productArea
+    .find('div.product_main p.instock.availability')
+    .text()
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const ratingClass = productArea.find('div.product_main p.star-rating').attr('class') || '';
+  const ratingWord = RATING_WORDS.find((word) => ratingClass.includes(word)) || null;
+
+  // Description sits in a <p> right after #product_description; some books have none
+  const descriptionEl = productArea.find('#product_description').next('p');
+  const description = descriptionEl.length ? descriptionEl.text().trim() : null;
+
+  return {
+    title,
+    product_url: bookUrl,
+    price_text: priceText,
+    availability_text: availabilityText,
+    rating_text: ratingWord,
+    description,
+    source_page: sourcePage,
+    fetched_at: new Date().toISOString(),
+  };
 }
 
 async function main() {
-  const { bookUrls, pagesVisited } = await discoverCataloguePages();
+  const bookEntries = await discoverCataloguePages();
+  console.log(`discovered=${bookEntries.size} unique book URLs`);
 
-  console.log(`catalogue_pages=${pagesVisited}`);
-  console.log(`discovered=${bookUrls.length}`);
-  console.log(`unique_urls=${bookUrls.length}`);
+  const records = [];
+  for (const [bookUrl, sourcePage] of bookEntries) {
+    const record = await extractBookRecord(bookUrl, sourcePage);
+    records.push(record);
+  }
+
+  console.log('\n--- Sample record ---');
+  console.log(JSON.stringify(records[0], null, 2));
+
+  console.log(`\ndetail_pages=${records.length}`);
 }
 
 main().catch((err) => {
