@@ -1,15 +1,20 @@
 const fs = require('fs');
 const path = require('path');
 const cheerio = require('cheerio');
+const { z } = require('zod');
 
 const USER_AGENT = 'FlyRankInternshipA9/1.0 (+https://github.com/YOUR_USERNAME/YOUR_REPO)';
 const TIMEOUT_MS = 8000;
 const DELAY_MS = 500;
 const CACHE_DIR = path.join(__dirname, '..', 'cache');
+const OUTPUT_DIR = path.join(__dirname, '..', 'output');
 const MAX_CATALOGUE_PAGES = 3; // assignment scope: only the first 3 pages
 
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
+if (!fs.existsSync(OUTPUT_DIR)) {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 }
 
 function sleep(ms) {
@@ -54,23 +59,18 @@ async function fetchWithCache(url, cacheFileName) {
   return { html, fromCache: false };
 }
 
-/**
- * Turns a book detail page's URL into a safe cache file name,
- * e.g. ".../a-light-in-the-attic_1000/index.html" -> "book-a-light-in-the-attic_1000.html"
- */
 function cacheNameForBookUrl(bookUrl) {
   const parts = bookUrl.split('/').filter(Boolean);
-  const slug = parts[parts.length - 2]; // the folder name before index.html
+  const slug = parts[parts.length - 2];
   return `book-${slug}.html`;
 }
 
 /**
  * Discovers the first MAX_CATALOGUE_PAGES catalogue pages and collects
- * every unique, absolute book URL found across them, remembering which
- * catalogue page each book came from (source_page).
+ * every unique, absolute book URL found across them (with source_page).
  */
 async function discoverCataloguePages() {
-  const bookEntries = new Map(); // url -> sourcePage
+  const bookEntries = new Map(); // url -> sourcePage (Map keys are naturally unique -> no duplicates)
   let pageNumber = 1;
   let pageUrl = 'https://books.toscrape.com/catalogue/page-1.html';
   let pagesVisited = 0;
@@ -96,9 +96,7 @@ async function discoverCataloguePages() {
       }
     });
 
-    if (pagesVisited >= MAX_CATALOGUE_PAGES) {
-      break;
-    }
+    if (pagesVisited >= MAX_CATALOGUE_PAGES) break;
 
     const nextHref = $('.next a').attr('href');
     if (nextHref) {
@@ -109,16 +107,15 @@ async function discoverCataloguePages() {
     }
   }
 
-  return bookEntries; // Map<bookUrl, sourcePage>
+  return bookEntries;
 }
 
-// Maps a star-rating class like "star-rating Three" to the word "Three"
 const RATING_WORDS = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five'];
 
 /**
  * Fetches one book detail page and extracts the 8 raw fields.
  */
-async function extractBookRecord(bookUrl, sourcePage) {
+async function extractRawRecord(bookUrl, sourcePage) {
   const cacheFileName = cacheNameForBookUrl(bookUrl);
   const { html, fromCache } = await fetchWithCache(bookUrl, cacheFileName);
 
@@ -127,12 +124,10 @@ async function extractBookRecord(bookUrl, sourcePage) {
   }
 
   const $ = cheerio.load(html);
-  const productArea = $('.product_page'); // scope selectors to the product area
+  const productArea = $('.product_page');
 
   const title = productArea.find('div.product_main h1').text().trim();
-
   const priceText = productArea.find('div.product_main p.price_color').text().trim();
-
   const availabilityText = productArea
     .find('div.product_main p.instock.availability')
     .text()
@@ -142,7 +137,6 @@ async function extractBookRecord(bookUrl, sourcePage) {
   const ratingClass = productArea.find('div.product_main p.star-rating').attr('class') || '';
   const ratingWord = RATING_WORDS.find((word) => ratingClass.includes(word)) || null;
 
-  // Description sits in a <p> right after #product_description; some books have none
   const descriptionEl = productArea.find('#product_description').next('p');
   const description = descriptionEl.length ? descriptionEl.text().trim() : null;
 
@@ -158,20 +152,88 @@ async function extractBookRecord(bookUrl, sourcePage) {
   };
 }
 
+/**
+ * Turns "£51.77" into 51.77. Keeps the raw text separately in the caller.
+ */
+function parsePriceGbp(priceText) {
+  const cleaned = priceText.replace(/[^0-9.]/g, ''); // strip £ and any stray chars
+  const value = parseFloat(cleaned);
+  return Number.isNaN(value) ? null : value;
+}
+
+/**
+ * Normalizes a raw record into the clean shape ready for validation.
+ */
+function normalizeRecord(raw) {
+  return {
+    title: raw.title,
+    product_url: raw.product_url, // canonical identity for the record
+    price_text: raw.price_text,
+    price_gbp: parsePriceGbp(raw.price_text),
+    availability_text: raw.availability_text,
+    rating_text: raw.rating_text,
+    description: raw.description,
+    source_page: raw.source_page,
+    fetched_at: raw.fetched_at,
+  };
+}
+
+// The schema: the recipe for a valid, finished record
+const BookSchema = z.object({
+  title: z.string().min(1),
+  product_url: z.string().url(),
+  price_text: z.string().min(1),
+  price_gbp: z.number().positive(),
+  availability_text: z.string().min(1),
+  rating_text: z.string().nullable(),
+  description: z.string().nullable(),
+  source_page: z.string().url(),
+  fetched_at: z.string().datetime(),
+});
+
 async function main() {
   const bookEntries = await discoverCataloguePages();
   console.log(`discovered=${bookEntries.size} unique book URLs`);
 
-  const records = [];
+  const validRecords = [];
+  const invalidRecords = [];
+
+  // product_url is the canonical identity — using it as a Map key means
+  // re-running never produces two records for the same book (idempotent).
+  const seenUrls = new Set();
+
   for (const [bookUrl, sourcePage] of bookEntries) {
-    const record = await extractBookRecord(bookUrl, sourcePage);
-    records.push(record);
+    if (seenUrls.has(bookUrl)) continue; // guard against accidental duplicates
+    seenUrls.add(bookUrl);
+
+    const raw = await extractRawRecord(bookUrl, sourcePage);
+    const normalized = normalizeRecord(raw);
+
+    const result = BookSchema.safeParse(normalized);
+    if (result.success) {
+      validRecords.push(result.data);
+    } else {
+      invalidRecords.push({
+        product_url: normalized.product_url,
+        reason: result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '),
+      });
+    }
   }
 
-  console.log('\n--- Sample record ---');
-  console.log(JSON.stringify(records[0], null, 2));
+  fs.writeFileSync(
+    path.join(OUTPUT_DIR, 'books.json'),
+    JSON.stringify(validRecords, null, 2),
+    'utf-8'
+  );
+  fs.writeFileSync(
+    path.join(OUTPUT_DIR, 'errors.json'),
+    JSON.stringify(invalidRecords, null, 2),
+    'utf-8'
+  );
 
-  console.log(`\ndetail_pages=${records.length}`);
+  console.log(`\nvalid_records=${validRecords.length}`);
+  console.log(`invalid_records=${invalidRecords.length}`);
+  console.log('Wrote output/books.json and output/errors.json');
 }
 
 main().catch((err) => {
