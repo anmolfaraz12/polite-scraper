@@ -8,21 +8,62 @@ const TIMEOUT_MS = 8000;
 const DELAY_MS = 500;
 const CACHE_DIR = path.join(__dirname, '..', 'cache');
 const OUTPUT_DIR = path.join(__dirname, '..', 'output');
-const MAX_CATALOGUE_PAGES = 3; // assignment scope: only the first 3 pages
+const MAX_CATALOGUE_PAGES = 3;
 
-if (!fs.existsSync(CACHE_DIR)) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
-if (!fs.existsSync(OUTPUT_DIR)) {
-  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-}
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Simple counters for the final run report
+const stats = {
+  pagesFetched: 0,
+  cacheHits: 0,
+  failedPages: 0,
+};
+
 /**
- * Fetches a URL politely, or reads it from cache if already saved.
+ * A fetch error that remembers the HTTP status, so callers can decide
+ * whether it's worth retrying (5xx / timeout) or not (404 / 403).
+ */
+class FetchError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.status = status; // null for network/timeout errors
+  }
+}
+
+async function fetchOnce(url) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: controller.signal,
+    });
+
+    if (response.status !== 200) {
+      throw new FetchError(`status ${response.status}`, response.status);
+    }
+
+    return await response.text();
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new FetchError('request timed out', null);
+    }
+    if (err instanceof FetchError) throw err;
+    throw new FetchError(err.message, null); // network-level error, e.g. DNS failure
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Fetches with cache, politeness delay, and ONE retry for timeouts/5xx.
+ * Never retries 404 or 403 — those won't fix themselves.
  */
 async function fetchWithCache(url, cacheFileName) {
   const cachePath = path.join(CACHE_DIR, cacheFileName);
@@ -30,31 +71,31 @@ async function fetchWithCache(url, cacheFileName) {
   if (fs.existsSync(cachePath)) {
     const html = fs.readFileSync(cachePath, 'utf-8');
     console.log(`CACHE HIT — ${cacheFileName} (${html.length} bytes)`);
+    stats.cacheHits++;
     return { html, fromCache: true };
   }
 
   console.log(`FETCH — ${url}`);
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
-
-  let response;
+  let html;
   try {
-    response = await fetch(url, {
-      headers: { 'User-Agent': USER_AGENT },
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timeoutId);
+    html = await fetchOnce(url);
+  } catch (err) {
+    const isRetryable = err.status === null || err.status >= 500;
+    const isNoRetry = err.status === 404 || err.status === 403;
+
+    if (isRetryable && !isNoRetry) {
+      console.log(`  retrying once — ${err.message}`);
+      await sleep(1000);
+      html = await fetchOnce(url); // second and final attempt; let it throw if it fails again
+    } else {
+      throw err; // 404 / 403 — don't retry, just surface it
+    }
   }
 
-  if (response.status !== 200) {
-    throw new Error(`Failed to fetch ${url} — status ${response.status}`);
-  }
-
-  const html = await response.text();
   fs.writeFileSync(cachePath, html, 'utf-8');
   console.log(`FETCH — saved ${cacheFileName} (${html.length} bytes)`);
+  stats.pagesFetched++;
 
   return { html, fromCache: false };
 }
@@ -65,12 +106,8 @@ function cacheNameForBookUrl(bookUrl) {
   return `book-${slug}.html`;
 }
 
-/**
- * Discovers the first MAX_CATALOGUE_PAGES catalogue pages and collects
- * every unique, absolute book URL found across them (with source_page).
- */
 async function discoverCataloguePages() {
-  const bookEntries = new Map(); // url -> sourcePage (Map keys are naturally unique -> no duplicates)
+  const bookEntries = new Map();
   let pageNumber = 1;
   let pageUrl = 'https://books.toscrape.com/catalogue/page-1.html';
   let pagesVisited = 0;
@@ -80,12 +117,9 @@ async function discoverCataloguePages() {
     const { html, fromCache } = await fetchWithCache(pageUrl, cacheFileName);
     pagesVisited++;
 
-    if (!fromCache) {
-      await sleep(DELAY_MS);
-    }
+    if (!fromCache) await sleep(DELAY_MS);
 
     const $ = cheerio.load(html);
-
     $('h3 a').each((_, el) => {
       const href = $(el).attr('href');
       if (href) {
@@ -112,16 +146,11 @@ async function discoverCataloguePages() {
 
 const RATING_WORDS = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five'];
 
-/**
- * Fetches one book detail page and extracts the 8 raw fields.
- */
 async function extractRawRecord(bookUrl, sourcePage) {
   const cacheFileName = cacheNameForBookUrl(bookUrl);
   const { html, fromCache } = await fetchWithCache(bookUrl, cacheFileName);
 
-  if (!fromCache) {
-    await sleep(DELAY_MS);
-  }
+  if (!fromCache) await sleep(DELAY_MS);
 
   const $ = cheerio.load(html);
   const productArea = $('.product_page');
@@ -152,22 +181,16 @@ async function extractRawRecord(bookUrl, sourcePage) {
   };
 }
 
-/**
- * Turns "£51.77" into 51.77. Keeps the raw text separately in the caller.
- */
 function parsePriceGbp(priceText) {
-  const cleaned = priceText.replace(/[^0-9.]/g, ''); // strip £ and any stray chars
+  const cleaned = priceText.replace(/[^0-9.]/g, '');
   const value = parseFloat(cleaned);
   return Number.isNaN(value) ? null : value;
 }
 
-/**
- * Normalizes a raw record into the clean shape ready for validation.
- */
 function normalizeRecord(raw) {
   return {
     title: raw.title,
-    product_url: raw.product_url, // canonical identity for the record
+    product_url: raw.product_url,
     price_text: raw.price_text,
     price_gbp: parsePriceGbp(raw.price_text),
     availability_text: raw.availability_text,
@@ -178,7 +201,6 @@ function normalizeRecord(raw) {
   };
 }
 
-// The schema: the recipe for a valid, finished record
 const BookSchema = z.object({
   title: z.string().min(1),
   product_url: z.string().url(),
@@ -191,32 +213,49 @@ const BookSchema = z.object({
   fetched_at: z.string().datetime(),
 });
 
+// TEMPORARY — proves one broken page can't take the run down.
+// Remove this line (and the .set() below) once you've seen failed_pages: 1 in the report.
+const INJECT_FAKE_URL_FOR_TESTING = false;
+
 async function main() {
+  const startTime = Date.now();
+  const startedAtIso = new Date(startTime).toISOString();
+
   const bookEntries = await discoverCataloguePages();
   console.log(`discovered=${bookEntries.size} unique book URLs`);
 
+  if (INJECT_FAKE_URL_FOR_TESTING) {
+    const fakeUrl = 'https://books.toscrape.com/catalogue/this-book-does-not-exist_9999/index.html';
+    bookEntries.set(fakeUrl, 'https://books.toscrape.com/catalogue/page-1.html');
+    console.log('(testing) injected one fake book URL on purpose');
+  }
+
   const validRecords = [];
   const invalidRecords = [];
-
-  // product_url is the canonical identity — using it as a Map key means
-  // re-running never produces two records for the same book (idempotent).
   const seenUrls = new Set();
 
   for (const [bookUrl, sourcePage] of bookEntries) {
-    if (seenUrls.has(bookUrl)) continue; // guard against accidental duplicates
+    if (seenUrls.has(bookUrl)) continue;
     seenUrls.add(bookUrl);
 
-    const raw = await extractRawRecord(bookUrl, sourcePage);
-    const normalized = normalizeRecord(raw);
+    try {
+      const raw = await extractRawRecord(bookUrl, sourcePage);
+      const normalized = normalizeRecord(raw);
+      const result = BookSchema.safeParse(normalized);
 
-    const result = BookSchema.safeParse(normalized);
-    if (result.success) {
-      validRecords.push(result.data);
-    } else {
-      invalidRecords.push({
-        product_url: normalized.product_url,
-        reason: result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '),
-      });
+      if (result.success) {
+        validRecords.push(result.data);
+      } else {
+        invalidRecords.push({
+          product_url: normalized.product_url,
+          reason: result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '),
+        });
+      }
+    } catch (err) {
+      // This page failed to fetch entirely — log it, count it, and move on.
+      // The rest of the run must survive.
+      console.log(`  FAILED — ${bookUrl} (${err.message})`);
+      stats.failedPages++;
     }
   }
 
@@ -231,9 +270,25 @@ async function main() {
     'utf-8'
   );
 
-  console.log(`\nvalid_records=${validRecords.length}`);
-  console.log(`invalid_records=${invalidRecords.length}`);
-  console.log('Wrote output/books.json and output/errors.json');
+  const endTime = Date.now();
+  const runReport = {
+    started_at: startedAtIso,
+    duration_ms: endTime - startTime,
+    pages_fetched: stats.pagesFetched,
+    cache_hits: stats.cacheHits,
+    valid_records: validRecords.length,
+    invalid_records: invalidRecords.length,
+    failed_pages: stats.failedPages,
+  };
+
+  fs.writeFileSync(
+    path.join(OUTPUT_DIR, 'run-report.json'),
+    JSON.stringify(runReport, null, 2),
+    'utf-8'
+  );
+
+  console.log('\n--- Run report ---');
+  console.log(JSON.stringify(runReport, null, 2));
 }
 
 main().catch((err) => {
